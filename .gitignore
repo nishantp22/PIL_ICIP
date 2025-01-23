@@ -1,7 +1,7 @@
 /models
 /trash
-/images
-/results
+# /images
+# /results
 /__pycache__
 /utils/__pycache__
 /env
