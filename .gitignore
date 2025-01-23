@@ -1,0 +1,8 @@
+/models
+/trash
+/images
+/results
+/__pycache__
+/utils/__pycache__
+/env
+/utils/backbones/__pycache__
