@@ -1,3 +1,5 @@
+#script to run ONLY flux
+
 import torch
 
 from optimum.quanto import freeze, qfloat8, quantize

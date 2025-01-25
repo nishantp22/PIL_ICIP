@@ -1,3 +1,5 @@
+#script to run ICLight with flux (with changes). Requires briarmbg.py
+
 import os
 import math
 import numpy as np
