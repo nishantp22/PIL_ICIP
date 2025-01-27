@@ -33,12 +33,15 @@ ckpt_id = "black-forest-labs/FLUX.1-dev"
 ckpt_4bit_id = "hf-internal-testing/flux.1-dev-nf4-pkg"
 
 
-transformer = FluxTransformer2DModel.from_pretrained(ckpt_4bit_id, subfolder="transformer")
+# transformer = FluxTransformer2DModel.from_pretrained(ckpt_4bit_id, subfolder="transformer")
+# text_encoder= T5EncoderModel.from_pretrained(ckpt_4bit_id, subfolder="text_encoder_2")
+transformer = FluxTransformer2DModel.from_pretrained(ckpt_id, subfolder="transformer")
+text_encoder= T5EncoderModel.from_pretrained(ckpt_id, subfolder="text_encoder_2")
 
 
-text_encoder = BertModel.from_pretrained("bert-base-uncased", torch_dtype=torch.float16, attn_implementation="sdpa")
-...
-# # text_encoder= T5EncoderModel.from_pretrained(ckpt_4bit_id, subfolder="text_encoder_2")
+
+
+
 # text_encoder = CLIPTextModel.from_pretrained(ckpt_4bit_id, subfolder="text_encoder_2")
 sd15_name = 'black-forest-labs/FLUX.1-dev'
 tokenizer = CLIPTokenizer.from_pretrained(sd15_name, subfolder="tokenizer")
