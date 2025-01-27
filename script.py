@@ -1,6 +1,24 @@
 from utils.ControlNet import generate_canny_image, load_models, create_pipeline, generate_image, generate_canny_from_folder,generate_depth_map
 import torch
 import gc
+import os
+import math
+import numpy as np
+import torch
+import safetensors.torch as sf
+
+from PIL import Image
+from diffusers import StableDiffusionPipeline, StableDiffusionImg2ImgPipeline
+from diffusers import AutoencoderKL, UNet2DConditionModel, DDIMScheduler, EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler
+from diffusers.models.attention_processor import AttnProcessor2_0
+from transformers import CLIPTextModel, CLIPTokenizer
+from briarmbg import BriaRMBG
+from enum import Enum
+from torch.hub import download_url_to_file
+import random
+import cv2
+
+
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -32,51 +50,6 @@ with torch.no_grad():
 flush()
 
 
-# from utils.ControlNet import (
-#     generate_canny_image,
-#     load_models,
-#     create_pipeline,
-#     generate_image,
-#     generate_canny_from_folder,
-#     generate_depth_map
-# )
-# from accelerate import Accelerator
-# import torch
-# import gc
 
-# def flush():
-#     gc.collect()
-#     torch.cuda.empty_cache()
-#     torch.cuda.reset_max_memory_allocated()
-#     torch.cuda.reset_peak_memory_stats()
 
-# flush()
 
-# # Initialize Accelerator
-# accelerator = Accelerator()
-
-# # Generate canny image
-# canny_image = generate_canny_from_folder("trash/to_send/image1.jpeg")
-
-# # Load models
-# controlnet, transformer = load_models(
-#     controlnet_model="InstantX/FLUX.1-dev-controlnet-canny",
-#     transformer_checkpoint="https://huggingface.co/city96/FLUX.1-dev-gguf/blob/main/flux1-dev-Q4_0.gguf"
-# )
-
-# # Move models to the appropriate device
-# controlnet, transformer = accelerator.prepare(controlnet, transformer)
-
-# # Create the pipeline
-# pipe = create_pipeline(controlnet, transformer)
-
-# # Generate the output image
-# output_image = generate_image(
-#     pipe,
-#     "high quality, realistic image of a british man of age 21, standing outside a church, happily posing in the afternoon",
-#     canny_image,
-#     canny_image.width,
-#     canny_image.height
-# )
-
-# flush()

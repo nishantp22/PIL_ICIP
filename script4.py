@@ -1,95 +1,97 @@
-#script to run ICLight with flux (with changes). Requires briarmbg.py
+#using flux over sd15 without iclight weights
 
 import os
 import math
 import numpy as np
 import torch
 import safetensors.torch as sf
+
 from PIL import Image
-from diffusers import FluxTransformer2DModel
-from diffusers import FluxPipeline, FluxImg2ImgPipeline
+from transformers import T5Tokenizer
+from transformers import T5EncoderModel
 from diffusers import StableDiffusionPipeline, StableDiffusionImg2ImgPipeline
+from diffusers import FluxPipeline, FluxImg2ImgPipeline
+from diffusers import FluxTransformer2DModel
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDIMScheduler, EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler
 from diffusers.models.attention_processor import AttnProcessor2_0
 from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import BertModel
 from briarmbg import BriaRMBG
 from enum import Enum
 from torch.hub import download_url_to_file
-import cv2
-from optimum.quanto import freeze, qfloat8, quantize
 import random
+import cv2
 
 
 
+# 'stablediffusionapi/realistic-vision-v51'
+# 'runwayml/stable-diffusion-v1-5'
+def bytes_to_giga_bytes(bytes):
+    return bytes / 1024 / 1024 / 1024
 
+ckpt_id = "black-forest-labs/FLUX.1-dev"
+ckpt_4bit_id = "hf-internal-testing/flux.1-dev-nf4-pkg"
+
+
+transformer = FluxTransformer2DModel.from_pretrained(ckpt_4bit_id, subfolder="transformer")
+
+
+text_encoder = BertModel.from_pretrained("bert-base-uncased", torch_dtype=torch.float16, attn_implementation="sdpa")
+...
+# # text_encoder= T5EncoderModel.from_pretrained(ckpt_4bit_id, subfolder="text_encoder_2")
+# text_encoder = CLIPTextModel.from_pretrained(ckpt_4bit_id, subfolder="text_encoder_2")
 sd15_name = 'black-forest-labs/FLUX.1-dev'
 tokenizer = CLIPTokenizer.from_pretrained(sd15_name, subfolder="tokenizer")
-text_encoder = CLIPTextModel.from_pretrained(sd15_name, subfolder="text_encoder")
 vae = AutoencoderKL.from_pretrained(sd15_name, subfolder="vae")
-transformer = FluxTransformer2DModel.from_pretrained(sd15_name, subfolder="transformer")
-# unet = UNet2DConditionModel.from_pretrained(sd15_name, subfolder="unet")
 rmbg = BriaRMBG.from_pretrained("briaai/RMBG-1.4")
 
-# Change UNet
-
-# with torch.no_grad():
-#     new_conv_in = torch.nn.Conv2d(8, unet.conv_in.out_channels, unet.conv_in.kernel_size, unet.conv_in.stride, unet.conv_in.padding)
-#     new_conv_in.weight.zero_()
-#     new_conv_in.weight[:, :4, :, :].copy_(unet.conv_in.weight)
-#     new_conv_in.bias = unet.conv_in.bias
-#     unet.conv_in = new_conv_in
 
 transformer_original_forward = transformer.forward
 
 
-def hooked_tf_forward(sample, timestep, encoder_hidden_states, **kwargs):
+def hooked_transformer_forward(sample, timestep, encoder_hidden_states, **kwargs):
     c_concat = kwargs['joint_attention_kwargs']['concat_conds'].to(sample)
     c_concat = torch.cat([c_concat] * (sample.shape[0] // c_concat.shape[0]), dim=0)
     new_sample = torch.cat([sample, c_concat], dim=1)
     kwargs['joint_attention_kwargs'] = {}
     return transformer_original_forward(new_sample, timestep, encoder_hidden_states, **kwargs)
-transformer.forward = hooked_tf_forward
+
+
+transformer.forward = hooked_transformer_forward
 
 # Load
 
-model_path = './models/iclight_sd15_fc.safetensors'
+# model_path = './models/iclight_sd15_fc.safetensors'
 
-if not os.path.exists(model_path):
-    download_url_to_file(url='https://huggingface.co/lllyasviel/ic-light/resolve/main/iclight_sd15_fc.safetensors', dst=model_path)
+# if not os.path.exists(model_path):
+#     download_url_to_file(url='https://huggingface.co/lllyasviel/ic-light/resolve/main/iclight_sd15_fc.safetensors', dst=model_path)
 
-sd_offset = sf.load_file(model_path)
-sd_origin = transformer.state_dict()
-keys = sd_origin.keys()
-sd_merged = {
-    k: sd_origin[k] + sd_offset[k] if k in sd_offset else sd_origin[k]
-    for k in sd_origin.keys()
-}
-transformer.load_state_dict(sd_merged, strict=True)
-del sd_offset, sd_origin, sd_merged, keys
+# sd_offset = sf.load_file(model_path)
+# sd_origin = unet.state_dict()
 
-# Device
+# print(sd_origin.keys())
+
+# print("Original model keys:", len(sd_origin.keys()))
+# print("Safetensors model keys:", len(sd_offset.keys()))
+# keys = sd_origin.keys()
+# sd_merged = {k: sd_origin[k] + sd_offset[k] for k in sd_origin.keys()}
+# unet.load_state_dict(sd_merged, strict=True)
+# del sd_offset, sd_origin, sd_merged, keys
+
+# # Device
 
 device = torch.device('cuda')
-text_encoder = text_encoder.to(device=device, dtype=torch.float16)
+text_encoder = text_encoder.to(device=device)
 vae = vae.to(device=device, dtype=torch.bfloat16)
-transformer = transformer.to(device=device, dtype=torch.bfloat16)
-# unet = unet.to(device=device, dtype=torch.float16)
+transformer = transformer.to(device=device)
 rmbg = rmbg.to(device=device, dtype=torch.float32)
 
-# SDP
+# # SDP
 
 transformer.set_attn_processor(AttnProcessor2_0())
-# unet.set_attn_processor(AttnProcessor2_0())
 vae.set_attn_processor(AttnProcessor2_0())
 
-
-quantize(transformer, weights=qfloat8)
-freeze(transformer)
-
-quantize(text_encoder, weights=qfloat8)
-freeze(text_encoder)
-
-# Samplers
+# # Samplers
 
 ddim_scheduler = DDIMScheduler(
     num_train_timesteps=1000,
@@ -117,40 +119,29 @@ dpmpp_2m_sde_karras_scheduler = DPMSolverMultistepScheduler(
     steps_offset=1
 )
 
-# Pipelines
+# # Pipelines
 
-t2i_pipe =FluxPipeline(
-    vae=None,
-    text_encoder=None,
-    tokenizer=tokenizer,
+t2i_pipe = FluxPipeline(
+    vae=vae,
+    text_encoder=text_encoder,
     text_encoder_2=None,
+    tokenizer=tokenizer,
     tokenizer_2=None,
-    transformer=None,
+    transformer=transformer,
     scheduler=dpmpp_2m_sde_karras_scheduler,
-    device_map="balanced",
-    max_memory={2: "16GB", 3: "16GB"},
 )
-
-t2i_pipe.text_encoder = text_encoder
-t2i_pipe.transformer = transformer
-
-t2i_pipe.enable_model_cpu_offload()
 
 i2i_pipe = FluxImg2ImgPipeline(
     vae=vae,
     text_encoder=text_encoder,
     tokenizer=tokenizer,
+    text_encoder_2=None,
     transformer=transformer,
     tokenizer_2=None,
-    text_encoder_2=None,
     scheduler=dpmpp_2m_sde_karras_scheduler,
 )
 
-i2i_pipe.text_encoder = text_encoder
-i2i_pipe.transformer = transformer
-
-i2i_pipe.enable_model_cpu_offload()
-
+# print(text_encoder.config)
 
 @torch.inference_mode()
 def encode_prompt_inner(txt: str):
@@ -167,10 +158,19 @@ def encode_prompt_inner(txt: str):
     chunks = [[id_start] + tokens[i: i + chunk_length] + [id_end] for i in range(0, len(tokens), chunk_length)]
     chunks = [pad(ck, id_pad, max_length) for ck in chunks]
 
-    token_ids = torch.tensor(chunks).to(device=device, dtype=torch.int64)
+    token_ids = torch.tensor(chunks).to(device=device)
+    # print(token_ids.dtype)
     conds = text_encoder(token_ids).last_hidden_state
 
     return conds
+
+# dummy_input = torch.randint(0, 100, (1, 10), dtype=torch.int64).to(device)
+# try:
+#     output = text_encoder(dummy_input)
+#     print(f"Output dtype: {output.last_hidden_state.dtype}")
+# except Exception as e:
+#     print(f"Error: {e}")
+
 
 
 @torch.inference_mode()
