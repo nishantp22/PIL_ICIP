@@ -73,12 +73,19 @@ transformer_original_forward = transformer.forward
 
 
 
-def hooked_transformer_forward(sample, timestep, encoder_hidden_states, **kwargs):
-    c_concat = kwargs['joint_attention_kwargs']['concat_conds'].to(sample)
-    c_concat = torch.cat([c_concat] * (sample.shape[0] // c_concat.shape[0]), dim=0)
-    new_sample = torch.cat([sample, c_concat], dim=1)
+def hooked_transformer_forward(hidden_states, encoder_hidden_states, pooled_projections, timestep, **kwargs):
+    c_concat = kwargs['joint_attention_kwargs']['concat_conds'].to(hidden_states)
+
+    batch_size, channels, width, height = c_concat.shape
+    c_concat = c_concat.reshape(batch_size, width * height, channels) 
+    c_concat = c_concat.reshape(batch_size, hidden_states.shape[1] , hidden_states.shape[2])
+
+    c_concat = torch.cat([c_concat] * (hidden_states.shape[0] // c_concat.shape[0]), dim=0)
+    new_sample = torch.cat([hidden_states, c_concat], dim=1)  # New shape: [batch_size, seq_len, in_channels + c_concat_channels]
     kwargs['joint_attention_kwargs'] = {}
-    return transformer_original_forward(new_sample, timestep, encoder_hidden_states, **kwargs)
+
+    return transformer_original_forward(new_sample, encoder_hidden_states, pooled_projections, timestep, **kwargs)
+
 
 
 transformer.forward = hooked_transformer_forward
@@ -185,7 +192,6 @@ def encode_prompt_inner(txt: str):
     chunks = [pad(ck, id_pad, max_length) for ck in chunks]
     token_ids = torch.tensor(chunks, dtype=torch.long).to(device)
 
-    print(f"Token IDs Shape: {token_ids.shape}, Max Value: {token_ids.max()}")
 
     outputs = text_encoder_2(token_ids)
 
@@ -234,10 +240,16 @@ def pytorch2numpy(imgs, quant=True):
 
 @torch.inference_mode()
 def numpy2pytorch(imgs):
-    print(imgs[0].shape)
     h = torch.from_numpy(np.stack(imgs, axis=0)).float() / 127.0 - 1.0  # so that 127 must be strictly 0.0
     h = h.movedim(-1, 1)
     return h
+
+def numpy2pytorch2(imgs):
+    h = torch.from_numpy(np.stack(imgs, axis=0)).float() / 127.0 - 1.0  # Normalize
+    b, height, width, channels = h.shape  # Extract dimensions
+    h = h.view(b, height * width, channels)  # Flatten width and height into one dimension
+    return h
+
 
 def resize_and_center_crop(image, target_width, target_height):
     pil_image = Image.fromarray(image)
@@ -307,9 +319,7 @@ def process(input_fg, prompt, image_width, image_height, num_samples, seed, step
 
     concat_conds = numpy2pytorch([fg]).to(device=vae.device, dtype=vae.dtype)
 
-    print(concat_conds.shape)
     concat_conds = vae.encode(concat_conds).latent_dist.mode() * vae.config.scaling_factor
-    print(concat_conds.shape)
 
     # conds, unconds = encode_prompt_pair(positive_prompt=prompt + ', ' + a_prompt, negative_prompt=n_prompt)
     (conds, conds_pooled), (unconds, unconds_pooled) = encode_prompt_pair(
