@@ -14,12 +14,13 @@ from diffusers import FluxPipeline, FluxImg2ImgPipeline
 from diffusers import FluxTransformer2DModel
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDIMScheduler, EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler
 from diffusers.models.attention_processor import AttnProcessor2_0
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer, T5Tokenizer
 from transformers import BertModel
 from briarmbg import BriaRMBG
 from enum import Enum
 from torch.hub import download_url_to_file
 import random
+from diffusers import FlowMatchEulerDiscreteScheduler
 import cv2
 
 
@@ -33,10 +34,10 @@ ckpt_id = "black-forest-labs/FLUX.1-dev"
 ckpt_4bit_id = "hf-internal-testing/flux.1-dev-nf4-pkg"
 
 
-# transformer = FluxTransformer2DModel.from_pretrained(ckpt_4bit_id, subfolder="transformer")
-# text_encoder= T5EncoderModel.from_pretrained(ckpt_4bit_id, subfolder="text_encoder_2")
-transformer = FluxTransformer2DModel.from_pretrained(ckpt_id, subfolder="transformer")
-text_encoder= T5EncoderModel.from_pretrained(ckpt_id, subfolder="text_encoder_2")
+transformer = FluxTransformer2DModel.from_pretrained(ckpt_4bit_id, subfolder="transformer")
+text_encoder_2= T5EncoderModel.from_pretrained(ckpt_4bit_id, subfolder="text_encoder_2")
+# transformer = FluxTransformer2DModel.from_pretrained(ckpt_id, subfolder="transformer")
+# text_encoder_2= T5EncoderModel.from_pretrained(ckpt_id, subfolder="text_encoder_2")
 
 
 
@@ -44,12 +45,32 @@ text_encoder= T5EncoderModel.from_pretrained(ckpt_id, subfolder="text_encoder_2"
 
 # text_encoder = CLIPTextModel.from_pretrained(ckpt_4bit_id, subfolder="text_encoder_2")
 sd15_name = 'black-forest-labs/FLUX.1-dev'
-tokenizer = CLIPTokenizer.from_pretrained(sd15_name, subfolder="tokenizer")
+tokenizer = T5Tokenizer.from_pretrained(ckpt_id, subfolder="tokenizer_2")
 vae = AutoencoderKL.from_pretrained(sd15_name, subfolder="vae")
 rmbg = BriaRMBG.from_pretrained("briaai/RMBG-1.4")
 
 
 transformer_original_forward = transformer.forward
+
+
+# def hooked_unet_forward(sample, timestep, encoder_hidden_states, **kwargs):
+#     c_concat = kwargs['cross_attention_kwargs']['concat_conds'].to(sample)
+#     c_concat = torch.cat([c_concat] * (sample.shape[0] // c_concat.shape[0]), dim=0)
+#     new_sample = torch.cat([sample, c_concat], dim=1)
+#     kwargs['cross_attention_kwargs'] = {}
+#     return unet_original_forward(new_sample, timestep, encoder_hidden_states, **kwargs)
+
+
+# unet.forward = hooked_unet_forward
+
+
+'''
+    ToDO: Modify the hooked_unet_forward method to configure it with the transformer instead. The code below is not working because the sample parameter
+    from UNetConditional2DModel of dimension 4 [batch size, img width, img height, channels] but the transformer from 
+    FluxTransformer2DModel instead has a hidden state parameter with 
+    dimension 3 [batch size, image_sequence_length]
+'''
+
 
 
 def hooked_transformer_forward(sample, timestep, encoder_hidden_states, **kwargs):
@@ -84,7 +105,7 @@ transformer.forward = hooked_transformer_forward
 # # Device
 
 device = torch.device('cuda')
-text_encoder = text_encoder.to(device=device)
+text_encoder_2 = text_encoder_2.to(device=device)
 vae = vae.to(device=device, dtype=torch.bfloat16)
 transformer = transformer.to(device=device)
 rmbg = rmbg.to(device=device, dtype=torch.float32)
@@ -122,79 +143,76 @@ dpmpp_2m_sde_karras_scheduler = DPMSolverMultistepScheduler(
     steps_offset=1
 )
 
+flow_match_euler_scheduler = FlowMatchEulerDiscreteScheduler()
+
 # # Pipelines
 
 t2i_pipe = FluxPipeline(
     vae=vae,
-    text_encoder=text_encoder,
-    text_encoder_2=None,
+    text_encoder_2=text_encoder_2,
+    text_encoder=None,
     tokenizer=tokenizer,
     tokenizer_2=None,
     transformer=transformer,
-    scheduler=dpmpp_2m_sde_karras_scheduler,
+    scheduler=flow_match_euler_scheduler,
 )
 
 i2i_pipe = FluxImg2ImgPipeline(
     vae=vae,
-    text_encoder=text_encoder,
+    text_encoder_2=text_encoder_2,
     tokenizer=tokenizer,
-    text_encoder_2=None,
+    text_encoder=None,
     transformer=transformer,
     tokenizer_2=None,
-    scheduler=dpmpp_2m_sde_karras_scheduler,
+    scheduler=flow_match_euler_scheduler,
 )
 
-# print(text_encoder.config)
 
 @torch.inference_mode()
 def encode_prompt_inner(txt: str):
     max_length = tokenizer.model_max_length
     chunk_length = tokenizer.model_max_length - 2
-    id_start = tokenizer.bos_token_id
-    id_end = tokenizer.eos_token_id
-    id_pad = id_end
-
-    def pad(x, p, i):
-        return x[:i] if len(x) >= i else x + [p] * (i - len(x))
+    id_start = tokenizer.bos_token_id or tokenizer.convert_tokens_to_ids("<s>")
+    id_end = tokenizer.eos_token_id or tokenizer.convert_tokens_to_ids("</s>")
+    id_pad = tokenizer.pad_token_id or tokenizer.convert_tokens_to_ids("<pad>")
 
     tokens = tokenizer(txt, truncation=False, add_special_tokens=False)["input_ids"]
     chunks = [[id_start] + tokens[i: i + chunk_length] + [id_end] for i in range(0, len(tokens), chunk_length)]
+
+    def pad(x, p, i):
+        return x[:i] if len(x) >= i else x + [p] * (i - len(x))
+    
     chunks = [pad(ck, id_pad, max_length) for ck in chunks]
+    token_ids = torch.tensor(chunks, dtype=torch.long).to(device)
 
-    token_ids = torch.tensor(chunks).to(device=device)
-    # print(token_ids.dtype)
-    conds = text_encoder(token_ids).last_hidden_state
+    print(f"Token IDs Shape: {token_ids.shape}, Max Value: {token_ids.max()}")
 
-    return conds
+    outputs = text_encoder_2(token_ids)
 
-# dummy_input = torch.randint(0, 100, (1, 10), dtype=torch.int64).to(device)
-# try:
-#     output = text_encoder(dummy_input)
-#     print(f"Output dtype: {output.last_hidden_state.dtype}")
-# except Exception as e:
-#     print(f"Error: {e}")
-
+    prompt_embeds = outputs.last_hidden_state  # Shape: [batch_size, seq_len, hidden_dim]
+    pooled_prompt_embeds = outputs.pooler_output if hasattr(outputs, 'pooler_output') else prompt_embeds[:, 0, :]  # Fallback to [CLS] token embedding
+    
+    return prompt_embeds, pooled_prompt_embeds
 
 
 @torch.inference_mode()
 def encode_prompt_pair(positive_prompt, negative_prompt):
-    c = encode_prompt_inner(positive_prompt)
-    uc = encode_prompt_inner(negative_prompt)
+    c, c_pooled = encode_prompt_inner(positive_prompt)
+    uc, uc_pooled = encode_prompt_inner(negative_prompt)
 
-    c_len = float(len(c))
-    uc_len = float(len(uc))
-    max_count = max(c_len, uc_len)
-    c_repeat = int(math.ceil(max_count / c_len))
-    uc_repeat = int(math.ceil(max_count / uc_len))
-    max_chunk = max(len(c), len(uc))
+    c_len, uc_len = len(c), len(uc)
+    max_len = max(c_len, uc_len)
+    c_repeat = (max_len + c_len - 1) // c_len
+    uc_repeat = (max_len + uc_len - 1) // uc_len
 
-    c = torch.cat([c] * c_repeat, dim=0)[:max_chunk]
-    uc = torch.cat([uc] * uc_repeat, dim=0)[:max_chunk]
+    c = torch.cat([c] * c_repeat, dim=0)[:max_len]
+    uc = torch.cat([uc] * uc_repeat, dim=0)[:max_len]
 
-    c = torch.cat([p[None, ...] for p in c], dim=1)
-    uc = torch.cat([p[None, ...] for p in uc], dim=1)
+    c_pooled = torch.cat([c_pooled] * c_repeat, dim=0)[:max_len]
+    uc_pooled = torch.cat([uc_pooled] * uc_repeat, dim=0)[:max_len]
 
-    return c, uc
+    return (c, c_pooled), (uc, uc_pooled)
+
 
 
 @torch.inference_mode()
@@ -216,10 +234,10 @@ def pytorch2numpy(imgs, quant=True):
 
 @torch.inference_mode()
 def numpy2pytorch(imgs):
+    print(imgs[0].shape)
     h = torch.from_numpy(np.stack(imgs, axis=0)).float() / 127.0 - 1.0  # so that 127 must be strictly 0.0
     h = h.movedim(-1, 1)
     return h
-
 
 def resize_and_center_crop(image, target_width, target_height):
     pil_image = Image.fromarray(image)
@@ -288,14 +306,23 @@ def process(input_fg, prompt, image_width, image_height, num_samples, seed, step
     fg = resize_and_center_crop(input_fg, image_width, image_height)
 
     concat_conds = numpy2pytorch([fg]).to(device=vae.device, dtype=vae.dtype)
-    concat_conds = vae.encode(concat_conds).latent_dist.mode() * vae.config.scaling_factor
 
-    conds, unconds = encode_prompt_pair(positive_prompt=prompt + ', ' + a_prompt, negative_prompt=n_prompt)
+    print(concat_conds.shape)
+    concat_conds = vae.encode(concat_conds).latent_dist.mode() * vae.config.scaling_factor
+    print(concat_conds.shape)
+
+    # conds, unconds = encode_prompt_pair(positive_prompt=prompt + ', ' + a_prompt, negative_prompt=n_prompt)
+    (conds, conds_pooled), (unconds, unconds_pooled) = encode_prompt_pair(
+    positive_prompt=prompt + ', ' + a_prompt,
+    negative_prompt=n_prompt,
+)
 
     if input_bg is None:
         latents = t2i_pipe(
-            prompt_embeds=conds,
-            negative_prompt_embeds=unconds,
+     prompt_embeds=conds,
+    pooled_prompt_embeds=conds_pooled,
+    negative_prompt_embeds=unconds,
+    negative_pooled_prompt_embeds=unconds_pooled,
             width=image_width,
             height=image_height,
             num_inference_steps=steps,
@@ -303,7 +330,7 @@ def process(input_fg, prompt, image_width, image_height, num_samples, seed, step
             generator=rng,
             output_type='latent',
             guidance_scale=cfg,
-            cross_attention_kwargs={'concat_conds': concat_conds},
+            joint_attention_kwargs={'concat_conds': concat_conds},
         ).images.to(vae.dtype) / vae.config.scaling_factor
     else:
         bg = resize_and_center_crop(input_bg, image_width, image_height)
@@ -321,7 +348,7 @@ def process(input_fg, prompt, image_width, image_height, num_samples, seed, step
             generator=rng,
             output_type='latent',
             guidance_scale=cfg,
-            cross_attention_kwargs={'concat_conds': concat_conds},
+            joint_attention_kwargs={'concat_conds': concat_conds},
         ).images.to(vae.dtype) / vae.config.scaling_factor
 
     pixels = vae.decode(latents).sample
@@ -354,7 +381,7 @@ def process(input_fg, prompt, image_width, image_height, num_samples, seed, step
         generator=rng,
         output_type='latent',
         guidance_scale=cfg,
-        cross_attention_kwargs={'concat_conds': concat_conds},
+        joint_attention_kwargs={'concat_conds': concat_conds},
     ).images.to(vae.dtype) / vae.config.scaling_factor
 
     pixels = vae.decode(latents).sample
