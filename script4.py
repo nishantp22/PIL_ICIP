@@ -371,7 +371,7 @@ def process(input_fg, prompt, image_width, image_height, num_samples, seed, step
 
     pixels = numpy2pytorch(pixels).to(device=vae.device, dtype=vae.dtype)
     latents = vae.encode(pixels).latent_dist.mode() * vae.config.scaling_factor
-    latents = latents.to(device=unet.device, dtype=unet.dtype)
+    latents = latents.to(device=transformer.device, dtype=transformer.dtype)
 
     image_height, image_width = latents.shape[2] * 8, latents.shape[3] * 8
 
