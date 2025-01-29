@@ -22,6 +22,10 @@ from torch.hub import download_url_to_file
 import random
 from diffusers import FlowMatchEulerDiscreteScheduler
 import cv2
+import inspect
+
+
+
 
 
 
@@ -43,9 +47,10 @@ text_encoder_2= T5EncoderModel.from_pretrained(ckpt_4bit_id, subfolder="text_enc
 
 
 
-# text_encoder = CLIPTextModel.from_pretrained(ckpt_4bit_id, subfolder="text_encoder_2")
+tokenizer = CLIPTokenizer.from_pretrained(ckpt_id, subfolder="tokenizer") 
+text_encoder = CLIPTextModel.from_pretrained(ckpt_id, subfolder="text_encoder")
 sd15_name = 'black-forest-labs/FLUX.1-dev'
-tokenizer = T5Tokenizer.from_pretrained(ckpt_id, subfolder="tokenizer_2")
+tokenizer_2 = T5Tokenizer.from_pretrained(ckpt_id, subfolder="tokenizer_2")
 vae = AutoencoderKL.from_pretrained(sd15_name, subfolder="vae")
 rmbg = BriaRMBG.from_pretrained("briaai/RMBG-1.4")
 
@@ -71,9 +76,8 @@ transformer_original_forward = transformer.forward
     dimension 3 [batch size, image_sequence_length]
 '''
 
-
-
-def hooked_transformer_forward(hidden_states, encoder_hidden_states, pooled_projections, timestep, **kwargs):
+def hooked_transformer_forward(hidden_states, encoder_hidden_states, pooled_projections, timestep, img_ids, txt_ids, guidance, **kwargs):
+    # print(kwargs)
     c_concat = kwargs['joint_attention_kwargs']['concat_conds'].to(hidden_states)
 
     batch_size, channels, width, height = c_concat.shape
@@ -81,10 +85,11 @@ def hooked_transformer_forward(hidden_states, encoder_hidden_states, pooled_proj
     c_concat = c_concat.reshape(batch_size, hidden_states.shape[1] , hidden_states.shape[2])
 
     c_concat = torch.cat([c_concat] * (hidden_states.shape[0] // c_concat.shape[0]), dim=0)
-    new_sample = torch.cat([hidden_states, c_concat], dim=1)  # New shape: [batch_size, seq_len, in_channels + c_concat_channels]
+
+    new_sample = torch.cat([hidden_states, c_concat], dim=1)
     kwargs['joint_attention_kwargs'] = {}
 
-    return transformer_original_forward(new_sample, encoder_hidden_states, pooled_projections, timestep, **kwargs)
+    return transformer_original_forward(new_sample, encoder_hidden_states, pooled_projections, timestep, img_ids, txt_ids, guidance, **kwargs)
 
 
 
@@ -113,6 +118,7 @@ transformer.forward = hooked_transformer_forward
 
 device = torch.device('cuda')
 text_encoder_2 = text_encoder_2.to(device=device)
+text_encoder=text_encoder.to(device=device)
 vae = vae.to(device=device, dtype=torch.bfloat16)
 transformer = transformer.to(device=device)
 rmbg = rmbg.to(device=device, dtype=torch.float32)
@@ -158,8 +164,8 @@ t2i_pipe = FluxPipeline(
     vae=vae,
     text_encoder_2=text_encoder_2,
     text_encoder=None,
-    tokenizer=tokenizer,
-    tokenizer_2=None,
+    tokenizer_2=tokenizer_2,
+    tokenizer=None,
     transformer=transformer,
     scheduler=flow_match_euler_scheduler,
 )
@@ -167,23 +173,23 @@ t2i_pipe = FluxPipeline(
 i2i_pipe = FluxImg2ImgPipeline(
     vae=vae,
     text_encoder_2=text_encoder_2,
-    tokenizer=tokenizer,
+    tokenizer_2=tokenizer_2,
     text_encoder=None,
     transformer=transformer,
-    tokenizer_2=None,
+    tokenizer=None,
     scheduler=flow_match_euler_scheduler,
 )
 
 
 @torch.inference_mode()
 def encode_prompt_inner(txt: str):
-    max_length = tokenizer.model_max_length
-    chunk_length = tokenizer.model_max_length - 2
-    id_start = tokenizer.bos_token_id or tokenizer.convert_tokens_to_ids("<s>")
-    id_end = tokenizer.eos_token_id or tokenizer.convert_tokens_to_ids("</s>")
-    id_pad = tokenizer.pad_token_id or tokenizer.convert_tokens_to_ids("<pad>")
+    max_length = tokenizer_2.model_max_length
+    chunk_length = tokenizer_2.model_max_length - 2
+    id_start = tokenizer_2.bos_token_id or tokenizer_2.convert_tokens_to_ids("<s>")
+    id_end = tokenizer_2.eos_token_id or tokenizer_2.convert_tokens_to_ids("</s>")
+    id_pad = tokenizer_2.pad_token_id or tokenizer_2.convert_tokens_to_ids("<pad>")
 
-    tokens = tokenizer(txt, truncation=False, add_special_tokens=False)["input_ids"]
+    tokens = tokenizer_2(txt, truncation=False, add_special_tokens=False)["input_ids"]
     chunks = [[id_start] + tokens[i: i + chunk_length] + [id_end] for i in range(0, len(tokens), chunk_length)]
 
     def pad(x, p, i):
@@ -193,10 +199,39 @@ def encode_prompt_inner(txt: str):
     token_ids = torch.tensor(chunks, dtype=torch.long).to(device)
 
 
+
     outputs = text_encoder_2(token_ids)
 
+
     prompt_embeds = outputs.last_hidden_state  # Shape: [batch_size, seq_len, hidden_dim]
-    pooled_prompt_embeds = outputs.pooler_output if hasattr(outputs, 'pooler_output') else prompt_embeds[:, 0, :]  # Fallback to [CLS] token embedding
+
+
+
+    prompt = [txt] if isinstance(txt, str) else txt
+    batch_size = len(prompt)
+
+
+    text_inputs = tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_overflowing_tokens=False,
+            return_length=False,
+            return_tensors="pt",
+    )
+    text_input_ids = text_inputs.input_ids
+    untruncated_ids = tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+    if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+        removed_text = tokenizer.batch_decode(untruncated_ids[:, tokenizer.model_max_length - 1 : -1])
+
+    pooled_prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=False)
+
+    pooled_prompt_embeds = pooled_prompt_embeds.pooler_output
+    pooled_prompt_embeds = pooled_prompt_embeds.to(dtype=text_encoder.dtype, device=device)
+
+    pooled_prompt_embeds = pooled_prompt_embeds.repeat(1, 1)
+    pooled_prompt_embeds = pooled_prompt_embeds.view(batch_size * 1, -1)
     
     return prompt_embeds, pooled_prompt_embeds
 
@@ -206,16 +241,18 @@ def encode_prompt_pair(positive_prompt, negative_prompt):
     c, c_pooled = encode_prompt_inner(positive_prompt)
     uc, uc_pooled = encode_prompt_inner(negative_prompt)
 
-    c_len, uc_len = len(c), len(uc)
-    max_len = max(c_len, uc_len)
-    c_repeat = (max_len + c_len - 1) // c_len
-    uc_repeat = (max_len + uc_len - 1) // uc_len
+    c_len = float(len(c))
+    uc_len = float(len(uc))
+    max_count = max(c_len, uc_len)
+    c_repeat = int(math.ceil(max_count / c_len))
+    uc_repeat = int(math.ceil(max_count / uc_len))
+    max_chunk = max(len(c), len(uc))
 
-    c = torch.cat([c] * c_repeat, dim=0)[:max_len]
-    uc = torch.cat([uc] * uc_repeat, dim=0)[:max_len]
+    c = torch.cat([c] * c_repeat, dim=0)[:max_chunk]
+    uc = torch.cat([uc] * uc_repeat, dim=0)[:max_chunk]
 
-    c_pooled = torch.cat([c_pooled] * c_repeat, dim=0)[:max_len]
-    uc_pooled = torch.cat([uc_pooled] * uc_repeat, dim=0)[:max_len]
+    c = torch.cat([p[None, ...] for p in c], dim=1)
+    uc = torch.cat([p[None, ...] for p in uc], dim=1)
 
     return (c, c_pooled), (uc, uc_pooled)
 
@@ -242,12 +279,6 @@ def pytorch2numpy(imgs, quant=True):
 def numpy2pytorch(imgs):
     h = torch.from_numpy(np.stack(imgs, axis=0)).float() / 127.0 - 1.0  # so that 127 must be strictly 0.0
     h = h.movedim(-1, 1)
-    return h
-
-def numpy2pytorch2(imgs):
-    h = torch.from_numpy(np.stack(imgs, axis=0)).float() / 127.0 - 1.0  # Normalize
-    b, height, width, channels = h.shape  # Extract dimensions
-    h = h.view(b, height * width, channels)  # Flatten width and height into one dimension
     return h
 
 
@@ -329,10 +360,10 @@ def process(input_fg, prompt, image_width, image_height, num_samples, seed, step
 
     if input_bg is None:
         latents = t2i_pipe(
-     prompt_embeds=conds,
-    pooled_prompt_embeds=conds_pooled,
-    negative_prompt_embeds=unconds,
-    negative_pooled_prompt_embeds=unconds_pooled,
+        prompt_embeds=conds,
+        pooled_prompt_embeds=conds_pooled,
+        negative_prompt_embeds=unconds,
+        negative_pooled_prompt_embeds=unconds_pooled,
             width=image_width,
             height=image_height,
             num_inference_steps=steps,
