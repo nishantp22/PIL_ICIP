@@ -13,8 +13,9 @@ from diffusers import StableDiffusionPipeline, StableDiffusionImg2ImgPipeline
 from diffusers import FluxPipeline, FluxImg2ImgPipeline
 from diffusers import FluxTransformer2DModel
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDIMScheduler, EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler
-from diffusers.models.attention_processor import AttnProcessor2_0
+from diffusers.models.attention_processor import AttnProcessor2_0, FluxAttnProcessor2_0
 from transformers import CLIPTextModel, CLIPTokenizer, T5Tokenizer
+from diffusers.image_processor import VaeImageProcessor
 from transformers import BertModel
 from briarmbg import BriaRMBG
 from enum import Enum
@@ -22,7 +23,6 @@ from torch.hub import download_url_to_file
 import random
 from diffusers import FlowMatchEulerDiscreteScheduler
 import cv2
-import inspect
 
 
 
@@ -55,6 +55,10 @@ vae = AutoencoderKL.from_pretrained(sd15_name, subfolder="vae")
 rmbg = BriaRMBG.from_pretrained("briaai/RMBG-1.4")
 
 
+vae_scale_factor =  8
+
+image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
+
 transformer_original_forward = transformer.forward
 
 
@@ -77,7 +81,8 @@ transformer_original_forward = transformer.forward
 '''
 
 def hooked_transformer_forward(hidden_states, encoder_hidden_states, pooled_projections, timestep, img_ids, txt_ids, guidance, **kwargs):
-    # print(kwargs)
+
+    # print(hidden_states.shape)
     c_concat = kwargs['joint_attention_kwargs']['concat_conds'].to(hidden_states)
 
     batch_size, channels, width, height = c_concat.shape
@@ -85,11 +90,16 @@ def hooked_transformer_forward(hidden_states, encoder_hidden_states, pooled_proj
     c_concat = c_concat.reshape(batch_size, hidden_states.shape[1] , hidden_states.shape[2])
 
     c_concat = torch.cat([c_concat] * (hidden_states.shape[0] // c_concat.shape[0]), dim=0)
+    # print((c_concat[0].dtype))
+    # print((hidden_states[0].dtype))
 
+    # print(c_concat.shape)
     new_sample = torch.cat([hidden_states, c_concat], dim=1)
     kwargs['joint_attention_kwargs'] = {}
+    # print(new_sample.shape)
 
-    return transformer_original_forward(new_sample, encoder_hidden_states, pooled_projections, timestep, img_ids, txt_ids, guidance, **kwargs)
+    return transformer_original_forward(hidden_states, encoder_hidden_states, pooled_projections, timestep, img_ids, txt_ids, guidance, **kwargs)
+    # return transformer_original_forward(new_sample, encoder_hidden_states, pooled_projections, timestep, img_ids, txt_ids, guidance, **kwargs)
 
 
 
@@ -125,7 +135,7 @@ rmbg = rmbg.to(device=device, dtype=torch.float32)
 
 # # SDP
 
-transformer.set_attn_processor(AttnProcessor2_0())
+transformer.set_attn_processor(FluxAttnProcessor2_0())
 vae.set_attn_processor(AttnProcessor2_0())
 
 # # Samplers
@@ -180,8 +190,22 @@ i2i_pipe = FluxImg2ImgPipeline(
     scheduler=flow_match_euler_scheduler,
 )
 
+def _unpack_latents(latents, height, width, vae_scale_factor):
+        batch_size, num_patches, channels = latents.shape
 
+        # VAE applies 8x compression on images but we must also account for packing which requires
+        # latent height and width to be divisible by 2.
+        height = 2 * (int(height) // (vae_scale_factor * 2))
+        width = 2 * (int(width) // (vae_scale_factor * 2))
+
+        latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
+        latents = latents.permute(0, 3, 1, 4, 2, 5)
+
+        latents = latents.reshape(batch_size, channels // (2 * 2), height, width)
+
+        return latents
 @torch.inference_mode()
+
 def encode_prompt_inner(txt: str):
     max_length = tokenizer_2.model_max_length
     chunk_length = tokenizer_2.model_max_length - 2
@@ -228,7 +252,7 @@ def encode_prompt_inner(txt: str):
     pooled_prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=False)
 
     pooled_prompt_embeds = pooled_prompt_embeds.pooler_output
-    pooled_prompt_embeds = pooled_prompt_embeds.to(dtype=text_encoder.dtype, device=device)
+    pooled_prompt_embeds = pooled_prompt_embeds.to(dtype=torch.float16, device=device)
 
     pooled_prompt_embeds = pooled_prompt_embeds.repeat(1, 1)
     pooled_prompt_embeds = pooled_prompt_embeds.view(batch_size * 1, -1)
@@ -348,15 +372,23 @@ def process(input_fg, prompt, image_width, image_height, num_samples, seed, step
 
     fg = resize_and_center_crop(input_fg, image_width, image_height)
 
+    
+
     concat_conds = numpy2pytorch([fg]).to(device=vae.device, dtype=vae.dtype)
 
+    
+
     concat_conds = vae.encode(concat_conds).latent_dist.mode() * vae.config.scaling_factor
+    print(concat_conds.shape)
 
     # conds, unconds = encode_prompt_pair(positive_prompt=prompt + ', ' + a_prompt, negative_prompt=n_prompt)
+
     (conds, conds_pooled), (unconds, unconds_pooled) = encode_prompt_pair(
     positive_prompt=prompt + ', ' + a_prompt,
     negative_prompt=n_prompt,
 )
+    print(conds_pooled.dtype)
+
 
     if input_bg is None:
         latents = t2i_pipe(
@@ -392,7 +424,17 @@ def process(input_fg, prompt, image_width, image_height, num_samples, seed, step
             joint_attention_kwargs={'concat_conds': concat_conds},
         ).images.to(vae.dtype) / vae.config.scaling_factor
 
+
+
+    latents = _unpack_latents(latents, image_height, image_width, vae_scale_factor)
+    latents = (latents / vae.config.scaling_factor) + vae.config.shift_factor
+
     pixels = vae.decode(latents).sample
+
+    pixels = image_processor.postprocess(pixels)
+
+    pixels[0].save("final.png")
+
     pixels = pytorch2numpy(pixels)
     pixels = [resize_without_crop(
         image=p,
