@@ -21,6 +21,7 @@ from briarmbg import BriaRMBG
 from enum import Enum
 from torch.hub import download_url_to_file
 import random
+import torchvision.transforms as transforms
 from diffusers import FlowMatchEulerDiscreteScheduler
 import cv2
 
@@ -82,7 +83,6 @@ transformer_original_forward = transformer.forward
 
 def hooked_transformer_forward(hidden_states, encoder_hidden_states, pooled_projections, timestep, img_ids, txt_ids, guidance, **kwargs):
 
-    # print(hidden_states.shape)
     c_concat = kwargs['joint_attention_kwargs']['concat_conds'].to(hidden_states)
 
     batch_size, channels, width, height = c_concat.shape
@@ -90,16 +90,11 @@ def hooked_transformer_forward(hidden_states, encoder_hidden_states, pooled_proj
     c_concat = c_concat.reshape(batch_size, hidden_states.shape[1] , hidden_states.shape[2])
 
     c_concat = torch.cat([c_concat] * (hidden_states.shape[0] // c_concat.shape[0]), dim=0)
-    # print((c_concat[0].dtype))
-    # print((hidden_states[0].dtype))
 
-    # print(c_concat.shape)
     new_sample = torch.cat([hidden_states, c_concat], dim=1)
     kwargs['joint_attention_kwargs'] = {}
-    # print(new_sample.shape)
 
     return transformer_original_forward(hidden_states, encoder_hidden_states, pooled_projections, timestep, img_ids, txt_ids, guidance, **kwargs)
-    # return transformer_original_forward(new_sample, encoder_hidden_states, pooled_projections, timestep, img_ids, txt_ids, guidance, **kwargs)
 
 
 
@@ -115,10 +110,7 @@ transformer.forward = hooked_transformer_forward
 # sd_offset = sf.load_file(model_path)
 # sd_origin = unet.state_dict()
 
-# print(sd_origin.keys())
 
-# print("Original model keys:", len(sd_origin.keys()))
-# print("Safetensors model keys:", len(sd_offset.keys()))
 # keys = sd_origin.keys()
 # sd_merged = {k: sd_origin[k] + sd_offset[k] for k in sd_origin.keys()}
 # unet.load_state_dict(sd_merged, strict=True)
@@ -371,31 +363,22 @@ def process(input_fg, prompt, image_width, image_height, num_samples, seed, step
     rng = torch.Generator(device=device).manual_seed(int(seed))
 
     fg = resize_and_center_crop(input_fg, image_width, image_height)
-
-    
-
     concat_conds = numpy2pytorch([fg]).to(device=vae.device, dtype=vae.dtype)
 
-    
-
     concat_conds = vae.encode(concat_conds).latent_dist.mode() * vae.config.scaling_factor
-    print(concat_conds.shape)
-
-    # conds, unconds = encode_prompt_pair(positive_prompt=prompt + ', ' + a_prompt, negative_prompt=n_prompt)
 
     (conds, conds_pooled), (unconds, unconds_pooled) = encode_prompt_pair(
     positive_prompt=prompt + ', ' + a_prompt,
     negative_prompt=n_prompt,
 )
-    print(conds_pooled.dtype)
 
 
     if input_bg is None:
         latents = t2i_pipe(
-        prompt_embeds=conds,
-        pooled_prompt_embeds=conds_pooled,
-        negative_prompt_embeds=unconds,
-        negative_pooled_prompt_embeds=unconds_pooled,
+            prompt_embeds=conds,
+            pooled_prompt_embeds=conds_pooled,
+            negative_prompt_embeds=unconds,
+            negative_pooled_prompt_embeds=unconds_pooled,
             width=image_width,
             height=image_height,
             num_inference_steps=steps,
@@ -413,7 +396,8 @@ def process(input_fg, prompt, image_width, image_height, num_samples, seed, step
             image=bg_latent,
             strength=lowres_denoise,
             prompt_embeds=conds,
-            negative_prompt_embeds=unconds,
+            pooled_prompt_embeds=conds_pooled,
+            # negative_prompt_embeds=unconds,
             width=image_width,
             height=image_height,
             num_inference_steps=int(round(steps / lowres_denoise)),
@@ -429,13 +413,17 @@ def process(input_fg, prompt, image_width, image_height, num_samples, seed, step
     latents = _unpack_latents(latents, image_height, image_width, vae_scale_factor)
     latents = (latents / vae.config.scaling_factor) + vae.config.shift_factor
 
-    pixels = vae.decode(latents).sample
+    imgs = vae.decode(latents).sample
+    imgs = image_processor.postprocess(imgs)
 
-    pixels = image_processor.postprocess(pixels)
+    imgs[0].save("final.png")
 
-    pixels[0].save("final.png")
+    pixels = transforms.ToTensor()(imgs[0])
+    pixels = pixels.unsqueeze(0)  # Shape becomes [1, C, W, H]
+
 
     pixels = pytorch2numpy(pixels)
+
     pixels = [resize_without_crop(
         image=p,
         target_width=int(round(image_width * highres_scale / 64.0) * 64),
@@ -452,11 +440,13 @@ def process(input_fg, prompt, image_width, image_height, num_samples, seed, step
     concat_conds = numpy2pytorch([fg]).to(device=vae.device, dtype=vae.dtype)
     concat_conds = vae.encode(concat_conds).latent_dist.mode() * vae.config.scaling_factor
 
+    latents = latents.to(torch.bfloat16)
     latents = i2i_pipe(
         image=latents,
         strength=highres_denoise,
         prompt_embeds=conds,
-        negative_prompt_embeds=unconds,
+        pooled_prompt_embeds=conds_pooled,
+        # negative_prompt_embeds=unconds,
         width=image_width,
         height=image_height,
         num_inference_steps=int(round(steps / highres_denoise)),
