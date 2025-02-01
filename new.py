@@ -249,9 +249,8 @@ def process(prompt, highres_scale, steps, highres_denoise, height, width):
         print("Running decoding.")
         latents = FluxPipeline._unpack_latents(latents, height, width, vae_scale_factor)
         latents = (latents / vae.config.scaling_factor) + vae.config.shift_factor
-
         image = vae.decode(latents, return_dict=False)[0]
         image = image_processor.postprocess(image, output_type="pil")
         image[0].save("imageF.png")
 
-process("a photo of a dog with cat-like look", 1.5, 25, 0.5, 512, 512)
+process("a 21 year old indian man standing in a football stadium with bright sunlight falling on his face from right", 1.5, 25, 0.5, 512, 512)

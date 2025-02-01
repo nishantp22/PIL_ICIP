@@ -531,5 +531,4 @@ def apply_relight(input_fg):
 
     process_relight(fg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, lowres_denoise, bg_source)
 
-
 apply_relight("images/original_image.png")
