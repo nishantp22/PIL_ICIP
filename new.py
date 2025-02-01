@@ -165,25 +165,32 @@ def process(prompt, highres_scale, steps, highres_denoise, height, width):
         image = image_processor.postprocess(image, output_type="pil")
         image[0].save("image.png")
 
-    # pixels = transforms.ToTensor()(image[0])
-    # pixels = pixels.unsqueeze(0)  # Shape becomes [1, C, W, H]
+    img=image[0]   
+
+    pixels = transforms.ToTensor()(image[0])
+
+    pixels = pixels.unsqueeze(0)  # Shape becomes [1, C, W, H]
+    pixels = pixels.to(device =device , dtype = torch.bfloat16)
+    latentsa = vae.encode(pixels).latent_dist.mode() * vae.config.scaling_factor
+    print(latentsa.dtype)
+    # latentsa = latentsa.to(dtype=torch.bfloat16)
 
     # print(pixels.shape)
-    pixels=image[0]
+    # pixels=image[0]
 
-    # pixels = pytorch2numpy(pixels)s
+    pixels = pytorch2numpy(pixels)
 
-    # pixels = [resize_without_crop(
-    #     image=p,
-    #     target_width=int(round(width * highres_scale / 64.0) * 64),
-    #     target_height=int(round(height * highres_scale / 64.0) * 64))
-    # for p in pixels]
 
-    # pixels = numpy2pytorch(pixels).to(device=vae.device, dtype=vae.dtype)
-    # latents = vae.encode(pixels).latent_dist.mode() * vae.config.scaling_factor
-    # latents = latents.to(device=device)
+    pixels = [resize_without_crop(
+        image=p,
+        target_width=int(round(width * highres_scale / 64.0) * 64),
+        target_height=int(round(height * highres_scale / 64.0) * 64))
+    for p in pixels]
 
-    # print(latents.shape)
+    pixels = numpy2pytorch(pixels).to(device=vae.device, dtype=vae.dtype)
+    latents = vae.encode(pixels).latent_dist.mode() * vae.config.scaling_factor
+    latents = latents.to(device=device)
+
 
     image_height, image_width = latents.shape[2] * 8, latents.shape[3] * 8
 
@@ -194,30 +201,28 @@ def process(prompt, highres_scale, steps, highres_denoise, height, width):
     del vae
 
     flush()
-    vae = AutoencoderKL.from_pretrained(ckpt_id, revision="refs/pr/1", subfolder="vae", torch_dtype=torch.bfloat16).to(
-        "cuda"
-    )
+
 
     transformer = FluxTransformer2DModel.from_pretrained(ckpt_id, subfolder="transformer", torch_dtype=torch.bfloat16)
 
     i2i_pipe = FluxImg2ImgPipeline.from_pretrained(
         ckpt_id,
-        vae=vae,
+        vae=None,
         text_encoder_2=None,
         tokenizer_2=None,
         text_encoder=None,
         transformer=transformer,
         tokenizer=None,
         torch_dtype=torch.bfloat16,
-    ).to("cuda:1")
+    ).to("cuda")
     
-    # latents = latents.to(torch.bfloat16)
     latents = i2i_pipe(
-        image=pixels,
+        image=img,
         strength=highres_denoise,
         prompt_embeds=prompt_embeds,
         pooled_prompt_embeds=pooled_prompt_embeds,
         width=image_width,
+        latents=latentsa,
         height=image_height,
         num_inference_steps=int(round(steps / highres_denoise)),
         # num_images_per_prompt=num_samples,
@@ -249,4 +254,4 @@ def process(prompt, highres_scale, steps, highres_denoise, height, width):
         image = image_processor.postprocess(image, output_type="pil")
         image[0].save("imageF.png")
 
-process("a photo of a dog with cat-like look", 1.5, 25, 0.5, 768, 1360)
+process("a photo of a dog with cat-like look", 1.5, 25, 0.5, 512, 512)
