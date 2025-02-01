@@ -238,9 +238,7 @@ def process(prompt, highres_scale, steps, highres_denoise, height, width):
 
     flush()
 
-    vae = AutoencoderKL.from_pretrained(ckpt_id, revision="refs/pr/1", subfolder="vae", torch_dtype=torch.bfloat16).to(
-        "cuda"
-    )
+    vae = AutoencoderKL.from_pretrained(ckpt_id, revision="refs/pr/1", subfolder="vae", torch_dtype=torch.bfloat16).to("cuda")
 
     vae_scale_factor = 8
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor*2)
