@@ -7,16 +7,28 @@ import gc
 from PIL import Image
 import torchvision.transforms as transforms
 import random
+import cv2
+from briarmbg import BriaRMBG
 
 import warnings
 warnings.filterwarnings("ignore")
-
 
 
 device = torch.device('cuda')
 
 
 rng = torch.Generator(device=device).manual_seed(int(random.randrange(100000000)))
+
+
+num_channels_latents = 16
+
+def _pack_latents(latents, batch_size, num_channels_latents, height, width):
+    latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
+    latents = latents.permute(0, 2, 4, 1, 3, 5)
+    latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
+
+
+    return latents
 
 @torch.inference_mode()
 def pytorch2numpy(imgs, quant=True):
@@ -62,18 +74,18 @@ def resize_without_crop(image, target_width, target_height):
 
 
 @torch.inference_mode()
-# def run_rmbg(img, sigma=0.0):
-#     H, W, C = img.shape
-#     assert C == 3
-#     k = (256.0 / float(H * W)) ** 0.5
-#     feed = resize_without_crop(img, int(64 * round(W * k)), int(64 * round(H * k)))
-#     feed = numpy2pytorch([feed]).to(device=device, dtype=torch.float32)
-#     alpha = rmbg(feed)[0][0]
-#     alpha = torch.nn.functional.interpolate(alpha, size=(H, W), mode="bilinear")
-#     alpha = alpha.movedim(1, -1)[0]
-#     alpha = alpha.detach().float().cpu().numpy().clip(0, 1)
-#     result = 127 + (img.astype(np.float32) - 127 + sigma) * alpha
-#     return result.clip(0, 255).astype(np.uint8), alpha
+def run_rmbg(rmbg, img, sigma=0.0):
+    H, W, C = img.shape
+    assert C == 3
+    k = (256.0 / float(H * W)) ** 0.5
+    feed = resize_without_crop(img, int(64 * round(W * k)), int(64 * round(H * k)))
+    feed = numpy2pytorch([feed]).to(device=device, dtype=torch.float32)
+    alpha = rmbg(feed)[0][0]
+    alpha = torch.nn.functional.interpolate(alpha, size=(H, W), mode="bilinear")
+    alpha = alpha.movedim(1, -1)[0]
+    alpha = alpha.detach().float().cpu().numpy().clip(0, 1)
+    result = 127 + (img.astype(np.float32) - 127 + sigma) * alpha
+    return result.clip(0, 255).astype(np.uint8), alpha
 
 
 def flush():
@@ -88,9 +100,27 @@ def bytes_to_giga_bytes(bytes):
 
 def process(prompt, highres_scale, steps, highres_denoise, height, width):
 
+    ckpt_id = "black-forest-labs/FLUX.1-schnell"
+
+    rmbg = BriaRMBG.from_pretrained("briaai/RMBG-1.4").to("cuda")
+    vae = AutoencoderKL.from_pretrained(ckpt_id, revision="refs/pr/1", subfolder="vae", torch_dtype=torch.bfloat16).to("cuda")
+
+
+    fg=cv2.imread("images/original_image.png")
+    fg = cv2.cvtColor(fg, cv2.COLOR_BGR2RGB)
+
+    fg, matting = run_rmbg(rmbg, fg)
+
+    fg = resize_and_center_crop(fg, width, height)
+
+    concat_conds = numpy2pytorch([fg]).to(device=vae.device, dtype=vae.dtype)
+    # concat_conds = vae.encode(concat_conds).latent_dist.mode() * vae.config.scaling_factor
+
+    del rmbg
+    del vae
+
     flush()
 
-    ckpt_id = "black-forest-labs/FLUX.1-schnell"
 
     text_encoder = CLIPTextModel.from_pretrained(ckpt_id, subfolder="text_encoder", torch_dtype=torch.bfloat16)
     text_encoder_2 = T5EncoderModel.from_pretrained(ckpt_id, subfolder="text_encoder_2", torch_dtype=torch.bfloat16)
@@ -191,7 +221,7 @@ def process(prompt, highres_scale, steps, highres_denoise, height, width):
     # for p in pixels]
 
     # pixels = numpy2pytorch(pixels).to(device=vae.device, dtype=vae.dtype)
-    # latents = vae.encode(pixels).latent_dist.mode() * vae.config.scaling_factor
+
     # latents = latents.to(device=device)
 
 
@@ -218,7 +248,9 @@ def process(prompt, highres_scale, steps, highres_denoise, height, width):
         torch_dtype=torch.bfloat16,
     ).to("cuda")
 
-    
+    print(latentsb.shape)
+
+    print("Running i2i denoising.")
     latents = i2i_pipe(
         image=img,
         strength=highres_denoise,
@@ -254,4 +286,4 @@ def process(prompt, highres_scale, steps, highres_denoise, height, width):
         image = image_processor.postprocess(image, output_type="pil")
         image[0].save("imageF.png")
 
-process("a cat holding a sign that says hello world", 1.5, 25, 0.5, 768, 1360)
+process("a cat holding a sign that says hello world", 1.5, 25, 0.5, 1024, 1024)
